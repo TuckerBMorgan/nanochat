@@ -20,7 +20,7 @@ import wandb
 import torch
 
 from nanochat.gpt import GPT, GPTConfig
-from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state, CurriculumDataLoader
+from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state, CurriculumDataLoader, RandomDataLoader
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
@@ -66,6 +66,9 @@ model_tag = "" # optionally override the model tag for the output checkpoint dir
 use_curriculum = False # enable curriculum learning (sort data by Flesch reading ease, train easy->hard)
 curriculum_tiers = 10 # number of difficulty tiers (10 = 10% chunks)
 curriculum_loss_threshold = 2.5 # smoothed loss threshold to advance to next tier
+# Random baseline settings (same tier structure as curriculum, but randomly shuffled within tiers)
+use_random_baseline = False # enable random baseline (same tiers as curriculum, but random order within)
+random_baseline_seed = 42 # seed for reproducible random shuffling
 # now allow CLI to override the settings via the configurator lol
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -174,7 +177,18 @@ if resuming:
 tokens_dir = os.path.join(base_dir, "tokenized_data")
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
 
-if use_curriculum:
+if use_random_baseline:
+    print0(f"Using random baseline with {curriculum_tiers} tiers, loss threshold {curriculum_loss_threshold}, seed {random_baseline_seed}")
+    train_loader = RandomDataLoader(
+        device_batch_size, max_seq_len,
+        split="train",
+        num_tiers=curriculum_tiers,
+        device=device,
+        resume_state_dict=dataloader_resume_state_dict,
+        seed=random_baseline_seed,
+    )
+    x, y, dataloader_state_dict = next(train_loader)
+elif use_curriculum:
     print0(f"Using curriculum learning with {curriculum_tiers} tiers, loss threshold {curriculum_loss_threshold}")
     train_loader = CurriculumDataLoader(
         device_batch_size, max_seq_len,
@@ -354,11 +368,12 @@ while True:
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
 
-    # Curriculum learning: advance tier when loss drops below threshold
-    if use_curriculum and step > 100:  # Wait for loss to stabilize
+    # Curriculum/random baseline: advance tier when loss drops below threshold
+    if (use_curriculum or use_random_baseline) and step > 100:  # Wait for loss to stabilize
         if debiased_smooth_loss < curriculum_loss_threshold:
             if train_loader.advance_tier():
-                print0(f"Step {step:05d} | Curriculum advanced to tier {train_loader.current_tier}")
+                mode_name = "Random baseline" if use_random_baseline else "Curriculum"
+                print0(f"Step {step:05d} | {mode_name} advanced to tier {train_loader.current_tier}")
                 # Reset smooth loss for the new tier to avoid immediate re-advancement
                 smooth_train_loss = 0
 
@@ -370,7 +385,7 @@ while True:
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
-    print_curriculum = f" tier: {train_loader.current_tier}/{curriculum_tiers-1} |" if use_curriculum else ""
+    print_curriculum = f" tier: {train_loader.current_tier}/{curriculum_tiers-1} |" if (use_curriculum or use_random_baseline) else ""
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm}{print_curriculum} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
     if step % 100 == 0:
         log_data = {
@@ -388,6 +403,9 @@ while True:
         if use_curriculum:
             log_data["curriculum/tier"] = train_loader.current_tier
             log_data["curriculum/max_tier"] = curriculum_tiers - 1
+        if use_random_baseline:
+            log_data["random_baseline/tier"] = train_loader.current_tier
+            log_data["random_baseline/max_tier"] = curriculum_tiers - 1
         wandb_run.log(log_data)
 
     # state update
