@@ -426,8 +426,8 @@ class RandomDataLoader:
             for pq_idx, filepath in enumerate(self.parquet_paths):
                 pf = pq.ParquetFile(filepath)
                 for rg_idx in range(pf.num_row_groups):
-                    rg = pf.read_row_group(rg_idx)
-                    num_docs_in_rg = len(rg.column('text'))
+                    # Use metadata to get row count without reading data (much faster)
+                    num_docs_in_rg = pf.metadata.row_group(rg_idx).num_rows
                     for _ in range(num_docs_in_rg):
                         all_docs.append((pq_idx, rg_idx, global_doc_idx))
                         global_doc_idx += 1

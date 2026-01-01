@@ -233,6 +233,8 @@ if not resuming:
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
     total_training_time = 0 # total wall-clock time of training
+    tier_times = {}  # {tier_number: time_in_seconds} for curriculum/random tracking
+    current_tier_start_time = 0  # when current tier started (in terms of total_training_time)
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
@@ -240,6 +242,8 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
+    tier_times = loop_state.get("tier_times", {})
+    current_tier_start_time = loop_state.get("current_tier_start_time", 0)
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -321,6 +325,8 @@ while True:
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
                     "total_training_time": total_training_time,
+                    "tier_times": tier_times,
+                    "current_tier_start_time": current_tier_start_time,
                 },
             },
             rank=ddp_rank,
@@ -371,9 +377,13 @@ while True:
     # Curriculum/random baseline: advance tier when loss drops below threshold
     if (use_curriculum or use_random_baseline) and step > 100:  # Wait for loss to stabilize
         if debiased_smooth_loss < curriculum_loss_threshold:
+            previous_tier = train_loader.current_tier
             if train_loader.advance_tier():
+                # Record time spent in the previous tier
+                tier_times[previous_tier] = total_training_time - current_tier_start_time
+                current_tier_start_time = total_training_time
                 mode_name = "Random baseline" if use_random_baseline else "Curriculum"
-                print0(f"Step {step:05d} | {mode_name} advanced to tier {train_loader.current_tier}")
+                print0(f"Step {step:05d} | {mode_name} advanced to tier {train_loader.current_tier} (tier {previous_tier} took {tier_times[previous_tier]/60:.2f}m)")
                 # Reset smooth loss for the new tier to avoid immediate re-advancement
                 smooth_train_loss = 0
 
@@ -416,6 +426,12 @@ print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 print0(f"Minimum validation bpb: {min_val_bpb:.4f}")
 
+# Record final tier time for curriculum/random baseline
+if use_curriculum or use_random_baseline:
+    final_tier = train_loader.current_tier
+    tier_times[final_tier] = total_training_time - current_tier_start_time
+    print0(f"Tier times: {', '.join(f'tier {k}: {v/60:.2f}m' for k, v in sorted(tier_times.items()))}")
+
 # Log to report
 from nanochat.report import get_report
 get_report().log(section="Base model training", data=[
@@ -439,7 +455,8 @@ get_report().log(section="Base model training", data=[
         "Total training flops": f"{flops_so_far:e}",
         "Total training time": f"{total_training_time/60:.2f}m",
         "Peak memory usage": f"{get_max_memory() / 1024 / 1024:.2f}MiB",
-    }
+    },
+    {f"Tier {k} time": f"{v/60:.2f}m" for k, v in sorted(tier_times.items())} if (use_curriculum or use_random_baseline) else None,
 ])
 
 # cleanup
